@@ -1,6 +1,6 @@
 # HexaCore
 
-**HexaCore** is a powerful, lightweight, and modern memory scanning and manipulation tool built from scratch in **C++** using the **Win32 API**. Designed with a sleek dark theme and custom-drawn UI components, it provides advanced debugging and memory analysis features inspired by industry standards.
+**HexaCore** is a powerful, lightweight, and modern memory scanning and manipulation tool built from scratch in **C++** using the **Win32 API**. Designed with a sleek dark theme and custom-drawn UI components, it provides advanced debugging and memory analysis features inspired by industry standards made with claude.
 
 ---
 
