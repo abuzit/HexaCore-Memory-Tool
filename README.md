@@ -34,3 +34,11 @@
 ## ⚠️ Disclaimer
 
 HexaCore is developed strictly for educational purposes, software debugging, and single-player game analysis. The creator assumes no liability and is not responsible for any misuse or bans resulting from the use of this software. Use at your own risk.
+
+---
+
+## 🔒 Security
+
+Hexacore is not a virus it is open source code you can analyze with AI and HexaCore not stealing y'all files or private informations like credit card or smth else!
+
+---
