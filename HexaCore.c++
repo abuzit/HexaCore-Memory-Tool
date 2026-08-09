@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <algorithm>
+#include <utility>
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -57,6 +58,7 @@
 #define ID_BTN_FILTER       34
 #define ID_BTN_CLEARFILTER  35
 #define ID_BTN_ADDCHAIN     36
+#define ID_COMBO_REGION     37
 
 // Hex Görüntüleyici / Opcode penceresi kontrolleri
 #define ID_HV_EDIT_ADDR      101
@@ -125,12 +127,26 @@ struct SavedEntry {
     uintptr_t moduleOffset() const { return chainOffsets.empty() ? 0 : chainOffsets.front(); }
 };
 
+// V2: Otomatik Bölge Filtreleme (Region Filtering - Fast Scan)
+// Taramayı "Tümü" yerine sadece Modül(.text/.data), Heap veya Stack bölgeleriyle
+// sınırlayarak çöp sonuçları (garbage results) büyük oranda azaltır.
+enum ScanRegionFilter {
+    REGION_ALL = 0,
+    REGION_MODULE = 1, // MEM_IMAGE (yüklü .exe/.dll görüntüleri — kod + ilişkili veri)
+    REGION_HEAP = 2,   // MEM_PRIVATE ve herhangi bir thread'in stack aralığıyla ÇAKIŞMAYAN bölgeler
+    REGION_STACK = 3   // MEM_PRIVATE ve bir thread'in [StackLimit, StackBase] aralığıyla ÇAKIŞAN bölgeler
+};
+
 struct ScanParams {
     double t1 = 0, t2 = 0;
     ValueType vType = TYPE_4BYTES;
     int scanType = 0;
     wstring aobPattern;
     vector<MemoryResult> baseResults; // Next Scan için anlık kopya
+    int regionFilter = REGION_ALL;
+    // Stack filtreleme için: taramaya başlamadan ÖNCE bir kez hesaplanır (tüm worker'lar
+    // salt-okunur olarak paylaşır); [StackLimit(düşük), StackBase(yüksek)] çiftleri.
+    vector<pair<uintptr_t, uintptr_t>> stackRanges;
 };
 
 struct PointerScanParams {
@@ -167,6 +183,7 @@ HANDLE hProcess = NULL;
 vector<MemoryResult> results;
 vector<SavedEntry> savedEntries;
 HWND hListRes, hLogBox, hEditName, hEditVal, hEditVal2, hEditAddr, hEditNewVal, hComboScanType, hComboValType;
+HWND hComboRegion = NULL;
 HWND hEditDesc, hListSaved, hProgressBar;
 HWND hBtnFirst, hBtnNext, hBtnStop, hBtnPointer;
 HWND hProcListDlg = NULL, hProcListBox = NULL;
@@ -188,6 +205,14 @@ int  g_ctxMenuIndex = -1;
 
 atomic<bool> g_scanning(false);
 atomic<bool> g_scanCancel(false);
+
+// ---- Çoklu thread'li tarama için ilerleme sayaçları ----
+// FirstScan: taranan bayt miktarını, NextScan: işlenen sonuç sayısını tutar.
+// Her worker thread kendi yerel vektörüne yazdığı için sonuç birleştirmede kilit
+// gerekmez; sadece bu ilerleme sayaçları thread'ler arasında paylaşılır.
+atomic<uint64_t> g_scanBytesDone(0);
+atomic<uint64_t> g_scanItemsDone(0);
+static const unsigned MAX_SCAN_THREADS = 16; // aşırı thread oluşturmayı sınırla
 
 WNDPROC g_oldSavedListProc = NULL;
 
@@ -219,67 +244,67 @@ BOOL CALLBACK ApplyFontProc(HWND hwndChild, LPARAM lParam) {
     return TRUE;
 }
 
-// ---- Panel vurgu renkleri (her bölüme kendi kimliğini veren renk paleti — koyu zeminde parlasın diye canlandırıldı) ----
-static const COLORREF ACCENT_CONNECT = RGB(56, 139, 253);   // parlak mavi   — Bağlantı
-static const COLORREF ACCENT_SCAN    = RGB(45, 212, 191);   // camgöbeği     — Tarama Ayarları
-static const COLORREF ACCENT_WRITE   = RGB(178, 102, 230);  // mor           — Bellek Yazma
-static const COLORREF ACCENT_LOG     = RGB(108, 117, 135);  // gri-mavi      — Log
-static const COLORREF ACCENT_RESULTS = RGB(52, 199, 89);    // yeşil         — Sonuçlar
-static const COLORREF ACCENT_SAVED   = RGB(94, 114, 235);   // indigo        — Cheat Tablosu
-static const COLORREF ACCENT_DANGER  = RGB(255, 69, 88);    // kırmızı       — kritik aksiyonlar
+// ---- Tek, tutarlı vurgu rengi: açık lacivert gradient (üstte açık, altta koyu) ----
+// Önceki sürümde her panel/buton kategorisi farklı bir renk taşıyordu (mavi/teal/mor/
+// yeşil/indigo/kırmızı) — bu göze dağınık ve "alakasız" göründüğü için TEK bir açık
+// lacivert gradient ile değiştirildi. Artık hem panel başlıkları hem tüm butonlar aynı
+// gradyanı kullanıyor; tek fark pasif (disabled) ve basılı (pressed) durumlarının
+// tonu hafifçe koyulaştırması.
+static const COLORREF ACCENT_GRAD_TOP    = RGB(96, 150, 214);  // açık lacivert (üst)
+static const COLORREF ACCENT_GRAD_BOTTOM = RGB(48, 92, 158);   // koyu lacivert (alt)
 
-// Renkli, yuvarlak köşeli butonlar çizer (owner-draw); her buton, ait olduğu
+// Dikey (yukarıdan aşağı) renk geçişini verilen dikdörtgene çizer. Yuvarlak köşeli
+// alanlarda kullanmak için, çağıran taraf çizimden önce SelectClipRgn ile kırpma
+// bölgesini ayarlamalı ve sonra sıfırlamalıdır.
+static void FillVerticalGradient(HDC hdc, const RECT& rc, COLORREF top, COLORREF bottom) {
+    int h = rc.bottom - rc.top;
+    if (h < 1) h = 1;
+    int rTop = GetRValue(top), gTop = GetGValue(top), bTop = GetBValue(top);
+    int rBot = GetRValue(bottom), gBot = GetGValue(bottom), bBot = GetBValue(bottom);
+    for (int y = 0; y < h; y++) {
+        double t = (double)y / (double)h;
+        BYTE r = (BYTE)(rTop + (rBot - rTop) * t);
+        BYTE g = (BYTE)(gTop + (gBot - gTop) * t);
+        BYTE b = (BYTE)(bTop + (bBot - bTop) * t);
+        HBRUSH strip = CreateSolidBrush(RGB(r, g, b));
+        RECT line = { rc.left, rc.top + y, rc.right, rc.top + y + 1 };
+        FillRect(hdc, &line, strip);
+        DeleteObject(strip);
+    }
+}
 
-// panelin vurgu rengini taşıyarak bölümler arasında görsel bir bağ kurar.
+// Renkli, yuvarlak köşeli, gradyanlı butonlar çizer (owner-draw). Tüm butonlar
+// aynı açık lacivert gradyanı kullanır — kategoriye göre renk değişmez.
 void DrawAccentButton(LPDRAWITEMSTRUCT dis) {
     wchar_t text[64];
     GetWindowTextW(dis->hwndItem, text, 64);
 
-    int id = GetDlgCtrlID(dis->hwndItem);
     bool pressed = (dis->itemState & ODS_SELECTED) != 0;
     bool disabled = (dis->itemState & ODS_DISABLED) != 0;
 
-    COLORREF base = ACCENT_CONNECT; // varsayılan
-    switch (id) {
-        case ID_BTN_CONNECT:
-        case ID_BTN_PROCLIST:
-        case ID_BTN_PROCSELECT:
-            base = ACCENT_CONNECT; break;
-        case ID_BTN_FIRST:
-        case ID_BTN_NEXT:
-            base = ACCENT_SCAN; break;
-        case ID_BTN_ADDLIST:
-        case ID_BTN_ADDCHAIN:
-        case ID_BTN_POINTERSCAN:
-        case ID_BTN_HEXVIEW:
-        case ID_BTN_NOPTOOL:
-        case ID_BTN_APPLYFREEZE:
-            base = ACCENT_WRITE; break;
-        case ID_BTN_FILTER:
-        case ID_BTN_CLEARFILTER:
-            base = ACCENT_RESULTS; break;
-        case ID_BTN_SAVETABLE:
-        case ID_BTN_LOADTABLE:
-            base = ACCENT_SAVED; break;
-        case ID_BTN_WRITE:
-        case ID_BTN_STOPSCAN:
-        case ID_BTN_DELLIST:
-            base = ACCENT_DANGER; break;
-        default: base = ACCENT_CONNECT; break;
+    COLORREF top = ACCENT_GRAD_TOP;
+    COLORREF bottom = ACCENT_GRAD_BOTTOM;
+    if (disabled) {
+        top = bottom = THEME_DISABLED;
+    } else if (pressed) {
+        top = Darken(ACCENT_GRAD_TOP, 0.78);
+        bottom = Darken(ACCENT_GRAD_BOTTOM, 0.78);
     }
 
-    if (disabled) base = THEME_DISABLED;
-    else if (pressed) base = Darken(base, 0.78);
+    HRGN btnRgn = CreateRoundRectRgn(dis->rcItem.left, dis->rcItem.top, dis->rcItem.right + 1, dis->rcItem.bottom + 1, 10, 10);
+    SelectClipRgn(dis->hDC, btnRgn);
+    FillVerticalGradient(dis->hDC, dis->rcItem, top, bottom);
+    SelectClipRgn(dis->hDC, NULL);
+    DeleteObject(btnRgn);
 
-    HBRUSH hBrush = CreateSolidBrush(base);
-    HPEN hPen = CreatePen(PS_SOLID, 1, base);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(dis->hDC, hBrush);
-    HPEN oldPen = (HPEN)SelectObject(dis->hDC, hPen);
+    // İnce, hafif koyu kenarlık (derinlik hissi için)
+    HPEN borderPen = CreatePen(PS_SOLID, 1, Darken(bottom, 0.82));
+    HBRUSH oldBrush = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+    HPEN oldPen = (HPEN)SelectObject(dis->hDC, borderPen);
     RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom, 10, 10);
     SelectObject(dis->hDC, oldBrush);
     SelectObject(dis->hDC, oldPen);
-    DeleteObject(hBrush);
-    DeleteObject(hPen);
+    DeleteObject(borderPen);
 
     SetBkMode(dis->hDC, TRANSPARENT);
     SetTextColor(dis->hDC, RGB(255, 255, 255));
@@ -292,7 +317,6 @@ void DrawAccentButton(LPDRAWITEMSTRUCT dis) {
 // Bir bölüm/panel tanımı: konum, vurgu rengi ve başlık metni.
 struct PanelInfo {
     RECT rc;
-    COLORREF accent;
     const wchar_t* title;
 };
 
@@ -306,15 +330,15 @@ static const int LAYOUT_GAP        = 20;
 static const int LAYOUT_RIGHT_X    = LAYOUT_LEFT_RIGHT + LAYOUT_GAP; // 560
 static const int LAYOUT_MARGIN     = 20;   // pencere kenarından panele boşluk
 static const int LAYOUT_DEFAULT_RIGHT_EDGE  = 1040; // varsayılan istemci genişliğinde (1060) sağ panel sınırı
-static const int LAYOUT_DEFAULT_BOTTOM_EDGE = 854;  // varsayılan istemci yüksekliğinde (874) alt panel sınırı
+static const int LAYOUT_DEFAULT_BOTTOM_EDGE = 894;  // varsayılan istemci yüksekliğinde (914) alt panel sınırı
 static const int LAYOUT_MIN_RIGHT_EDGE  = LAYOUT_RIGHT_X + 320; // pencere küçültülse bile panel bozulmasın
-static const int LAYOUT_MIN_BOTTOM_EDGE = 356 + 300;
+static const int LAYOUT_MIN_BOTTOM_EDGE = 396 + 300;
 
 // Pencere bu boyuttan (dış çerçeve dahil) daha küçük yapılamaz; böylece
 // panel/kontrol yerleşimi hiçbir zaman üst üste binmez. Büyütme ve
 // "Ekranı Kapla" (maximize) serbest.
 static const int MAIN_WIN_MIN_W = 1100;
-static const int MAIN_WIN_MIN_H = 960;
+static const int MAIN_WIN_MIN_H = 1000;
 
 // Ana penceredeki tüm kart/panellerin yerleşim tablosu. WM_CREATE (kontrol
 // konumlandırma) ve WM_PAINT (kart çizimi) bu tabloyla senkron çalışır.
@@ -322,12 +346,12 @@ static const int MAIN_WIN_MIN_H = 960;
 // yapıldığında RelayoutMainWindow() bu tabloyu güncelliyor.
 enum { PANEL_IDX_CONNECT = 0, PANEL_IDX_SCAN = 1, PANEL_IDX_WRITE = 2, PANEL_IDX_LOG = 3, PANEL_IDX_RESULTS = 4, PANEL_IDX_SAVED = 5 };
 static PanelInfo g_mainPanels[] = {
-    { {LAYOUT_LEFT_X,  20, LAYOUT_LEFT_RIGHT, 110}, ACCENT_CONNECT, L"Bağlantı" },
-    { {LAYOUT_LEFT_X, 128, LAYOUT_LEFT_RIGHT, 338}, ACCENT_SCAN,    L"Tarama Ayarları" },
-    { {LAYOUT_LEFT_X, 356, LAYOUT_LEFT_RIGHT, 686}, ACCENT_WRITE,   L"Bellek Yazma" },
-    { {LAYOUT_LEFT_X, 704, LAYOUT_LEFT_RIGHT, LAYOUT_DEFAULT_BOTTOM_EDGE}, ACCENT_LOG,     L"Log" },
-    { {LAYOUT_RIGHT_X,  20, LAYOUT_DEFAULT_RIGHT_EDGE, 338}, ACCENT_RESULTS, L"Sonuçlar" },
-    { {LAYOUT_RIGHT_X, 356, LAYOUT_DEFAULT_RIGHT_EDGE, LAYOUT_DEFAULT_BOTTOM_EDGE}, ACCENT_SAVED, L"Kayıtlı Adresler (Cheat Tablosu) — kutucuk: Dondur/Çöz" },
+    { {LAYOUT_LEFT_X,  20, LAYOUT_LEFT_RIGHT, 110}, L"Bağlantı" },
+    { {LAYOUT_LEFT_X, 128, LAYOUT_LEFT_RIGHT, 378}, L"Tarama Ayarları" },
+    { {LAYOUT_LEFT_X, 396, LAYOUT_LEFT_RIGHT, 726}, L"Bellek Yazma" },
+    { {LAYOUT_LEFT_X, 744, LAYOUT_LEFT_RIGHT, LAYOUT_DEFAULT_BOTTOM_EDGE}, L"Log" },
+    { {LAYOUT_RIGHT_X,  20, LAYOUT_DEFAULT_RIGHT_EDGE, 338}, L"Sonuçlar" },
+    { {LAYOUT_RIGHT_X, 356, LAYOUT_DEFAULT_RIGHT_EDGE, LAYOUT_DEFAULT_BOTTOM_EDGE}, L"Kayıtlı Adresler (Cheat Tablosu) — kutucuk: Dondur/Çöz" },
 };
 
 // Yumuşak gölge + beyaz gövde + renkli üst şerit + başlık yazısı olan bir
@@ -355,14 +379,17 @@ static void DrawCardPanel(HDC hdc, const PanelInfo& p) {
     DeleteObject(bodyBrush);
     DeleteObject(borderPen);
 
-    // Renkli başlık şeridi (üst köşeler yuvarlak kalacak şekilde kart bölgesiyle kesişim alınır)
+    // Başlık şeridi: tüm panellerde aynı açık lacivert gradyan (üst köşeler yuvarlak
+    // kalacak şekilde kart bölgesiyle kesişim alınır). p.accent artık kullanılmıyor —
+    // tutarlılık için tek bir gradyan tercih edildi.
     HRGN panelRgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, PANEL_RADIUS, PANEL_RADIUS);
     HRGN headerRgn = CreateRectRgn(rc.left, rc.top, rc.right, rc.top + PANEL_HEADER_H);
     HRGN clipRgn = CreateRectRgn(0, 0, 0, 0);
     CombineRgn(clipRgn, panelRgn, headerRgn, RGN_AND);
-    HBRUSH accentBrush = CreateSolidBrush(p.accent);
-    FillRgn(hdc, clipRgn, accentBrush);
-    DeleteObject(accentBrush);
+    SelectClipRgn(hdc, clipRgn);
+    RECT headerRc = { rc.left, rc.top, rc.right, rc.top + PANEL_HEADER_H };
+    FillVerticalGradient(hdc, headerRc, ACCENT_GRAD_TOP, ACCENT_GRAD_BOTTOM);
+    SelectClipRgn(hdc, NULL);
     DeleteObject(panelRgn);
     DeleteObject(headerRgn);
     DeleteObject(clipRgn);
@@ -420,7 +447,7 @@ void RelayoutMainWindow(HWND hwnd) {
 
     // --- Log paneli: sadece yüksekliği esner (genişlik sabit sol sütun) ---
     if (hLogBox) {
-        int y = 742, x = 36, w = LAYOUT_LEFT_RIGHT - 16 - x;
+        int y = 782, x = 36, w = LAYOUT_LEFT_RIGHT - 16 - x;
         int h = bottomEdge - 16 - y;
         if (h < 40) h = 40;
         MoveWindow(hLogBox, x, y, w, h, TRUE);
@@ -501,6 +528,118 @@ DWORD GetProcessIdByName(const wchar_t* processName) {
 
 static bool IsWritableMemory(DWORD protection) {
     return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY;
+}
+
+// ---- V2: Bölge Filtreleme (Region Filtering) — Stack tespiti ----
+// NtQueryInformationThread ile her thread'in TEB (Thread Environment Block) adresini
+// öğrenip, TEB'in başındaki NT_TIB yapısından StackBase/StackLimit'i okuyoruz.
+// Bu, Cheat Engine ve benzeri araçların da kullandığı standart, iyi belgelenmiş bir
+// tekniktir (undocumented ama 20+ yıldır stabil). ntdll.dll zaten her proseste yüklü
+// olduğu için ekstra link bağımlılığı gerekmez (GetProcAddress ile çalışma zamanında
+// çözülür).
+typedef LONG (NTAPI* PFN_NtQueryInformationThread)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static PFN_NtQueryInformationThread GetNtQueryInformationThread() {
+    static PFN_NtQueryInformationThread cached = NULL;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) cached = (PFN_NtQueryInformationThread)GetProcAddress(hNtdll, "NtQueryInformationThread");
+    }
+    return cached;
+}
+
+// THREAD_BASIC_INFORMATION ile aynı bellek yerleşimine sahip yerel struct
+// (winternl.h sürümleri arasındaki farklardan bağımsız olmak için elle tanımlandı).
+struct MsThreadBasicInfo {
+    LONG   ExitStatus;
+    PVOID  TebBaseAddress;
+    PVOID  UniqueProcess; // CLIENT_ID.UniqueProcess
+    PVOID  UniqueThread;  // CLIENT_ID.UniqueThread
+    ULONG_PTR AffinityMask;
+    LONG   Priority;
+    LONG   BasePriority;
+};
+
+// Bir thread handle'ından, hedef sürecin belleğinde okuyarak [StackLimit, StackBase]
+// aralığını (düşük..yüksek adres) elde eder. Başarısızsa false döner.
+static bool ReadThreadStackRange(HANDLE hThread, HANDLE hTargetProcess, uintptr_t& outLow, uintptr_t& outHigh) {
+    PFN_NtQueryInformationThread pNtQIT = GetNtQueryInformationThread();
+    if (!pNtQIT) return false;
+
+    MsThreadBasicInfo tbi = {};
+    ULONG retLen = 0;
+    const ULONG ThreadBasicInformation = 0;
+    LONG status = pNtQIT(hThread, ThreadBasicInformation, &tbi, sizeof(tbi), &retLen);
+    if (status != 0 || !tbi.TebBaseAddress) return false; // 0 == STATUS_SUCCESS
+
+    // NT_TIB (TEB'in ilk üyesi): { ExceptionList; StackBase; StackLimit; ... }
+    uintptr_t tib[3] = { 0, 0, 0 };
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(hTargetProcess, tbi.TebBaseAddress, tib, sizeof(tib), &bytesRead) || bytesRead < sizeof(tib)) {
+        return false;
+    }
+
+    uintptr_t stackBase = tib[1];  // yüksek adres (stack'in başlangıcı)
+    uintptr_t stackLimit = tib[2]; // düşük adres (o anki commit sınırı)
+    if (stackBase == 0 || stackLimit == 0) return false;
+    if (stackBase < stackLimit) std::swap(stackBase, stackLimit);
+
+    outLow = stackLimit;
+    outHigh = stackBase;
+    return true;
+}
+
+// Hedef sürecin TÜM thread'lerinin stack aralıklarını toplar. First Scan başlamadan
+// önce (workerlar oluşturulmadan) BİR KEZ çağrılır; sonuç tüm worker'lara salt-okunur
+// olarak paylaşılır.
+static vector<pair<uintptr_t, uintptr_t>> GetThreadStackRanges(DWORD pid, HANDLE hTargetProcess) {
+    vector<pair<uintptr_t, uintptr_t>> ranges;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return ranges;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    uintptr_t lo = 0, hi = 0;
+                    if (ReadThreadStackRange(hThread, hTargetProcess, lo, hi)) {
+                        ranges.push_back({ lo, hi });
+                    }
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return ranges;
+}
+
+// Verilen bellek bölgesinin herhangi bir stack aralığıyla çakışıp çakışmadığını kontrol eder.
+static bool RegionOverlapsAnyStack(uintptr_t regionStart, uintptr_t regionSize, const vector<pair<uintptr_t, uintptr_t>>& stackRanges) {
+    uintptr_t regionEnd = regionStart + regionSize;
+    for (const auto& r : stackRanges) {
+        if (regionStart < r.second && regionEnd > r.first) return true; // aralık çakışması
+    }
+    return false;
+}
+
+// Bir bellek bölgesinin, seçilen bölge filtresine uyup uymadığını belirler.
+// (MEM_COMMIT + yazılabilirlik kontrolü zaten çağıran tarafta yapılıyor; bu sadece
+// Modül/Heap/Stack ayrımını ekler.)
+static bool RegionMatchesFilter(int filter, DWORD memType, uintptr_t regionStart, uintptr_t regionSize, const vector<pair<uintptr_t, uintptr_t>>& stackRanges) {
+    if (filter == REGION_ALL) return true;
+    if (filter == REGION_MODULE) return memType == MEM_IMAGE;
+    bool isPrivate = (memType == MEM_PRIVATE);
+    if (!isPrivate) return false; // Heap ve Stack sadece MEM_PRIVATE bölgelerde olur
+    bool onStack = RegionOverlapsAnyStack(regionStart, regionSize, stackRanges);
+    if (filter == REGION_STACK) return onStack;
+    if (filter == REGION_HEAP) return !onStack;
+    return true;
 }
 
 // Değer Karşılaştırma Motoru (All seçeneği için tip bazlı kontrol)
@@ -752,47 +891,51 @@ void WriteMemory(uintptr_t address, ValueType type, const wstring& valStr, bool 
 }
 
 // ---- Taramaları arka planda çalıştıran thread fonksiyonları (GUI donmasın diye) ----
+//
+// V2: Çoklu İş Parçacıklı (Multi-Threaded) Bellek Tarama
+// SYSTEM_INFO ile çekirdek sayısı öğrenilir, adres uzayı (First Scan) ya da
+// önceki sonuç listesi (Next Scan) o kadar parçaya bölünür ve her parça kendi
+// worker thread'inde bağımsız olarak taranır. Her worker SADECE kendi yerel
+// vektörüne yazdığı için sonuçları birleştirirken kilit (mutex) gerekmez;
+// paylaşılan tek şey ilerleme sayaçlarıdır (atomic).
 
-DWORD WINAPI FirstScanThread(LPVOID lp) {
-    ScanParams* params = (ScanParams*)lp;
-    vector<MemoryResult>* out = new vector<MemoryResult>();
+// --- First Scan worker ---
+struct FirstScanWorkerParams {
+    ScanParams* shared;         // salt-okunur ortak parametreler (tüm worker'lar aynısını okur)
+    const vector<int>* aobPattern; // önceden bir kez parse edilmiş, salt-okunur
+    uintptr_t startAddr, endAddr;  // bu worker'ın taramaktan sorumlu olduğu adres aralığı
+    vector<MemoryResult>* out;     // bu worker'a özel sonuç listesi (paylaşılmaz)
+};
 
-    if (!hProcess) {
-        PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, 0);
-        delete params;
-        return 0;
-    }
-
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    LPVOID address = 0;
+static void ScanRangeFirst(FirstScanWorkerParams* wp) {
+    ScanParams* params = wp->shared;
+    LPVOID address = (LPVOID)wp->startAddr;
     MEMORY_BASIC_INFORMATION mbi;
-    uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
-    if (maxAddr == 0) maxAddr = 1;
 
-    vector<int> aobPattern;
-    if (params->vType == TYPE_AOB) aobPattern = ParseAOB(params->aobPattern);
-
-    int lastPercent = -1;
-
-    while (address < sysInfo.lpMaximumApplicationAddress) {
+    while ((uintptr_t)address < wp->endAddr) {
         if (g_scanCancel.load()) break;
 
         if (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            if (mbi.State == MEM_COMMIT && IsWritableMemory(mbi.Protect)) {
-                vector<char> buffer(mbi.RegionSize);
+            // Bölge, bu worker'ın aralığını aşıyorsa taşmayı önlemek için sınırla
+            uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            SIZE_T regionSize = mbi.RegionSize;
+            if (regionStart + regionSize > wp->endAddr) regionSize = wp->endAddr - regionStart;
+
+            if (mbi.State == MEM_COMMIT && IsWritableMemory(mbi.Protect) && regionSize > 0 &&
+                RegionMatchesFilter(params->regionFilter, mbi.Type, regionStart, regionSize, params->stackRanges)) {
+                vector<char> buffer(regionSize);
                 SIZE_T bytesRead;
 
-                if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead) && bytesRead >= 1) {
+                if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), regionSize, &bytesRead) && bytesRead >= 1) {
                     if (params->vType == TYPE_AOB) {
-                        if (!aobPattern.empty()) {
-                            for (SIZE_T i = 0; i + aobPattern.size() <= bytesRead; i++) {
-                                if (MatchAOB((uint8_t*)buffer.data() + i, bytesRead - i, aobPattern)) {
+                        if (wp->aobPattern && !wp->aobPattern->empty()) {
+                            for (SIZE_T i = 0; i + wp->aobPattern->size() <= bytesRead; i++) {
+                                if (MatchAOB((uint8_t*)buffer.data() + i, bytesRead - i, *wp->aobPattern)) {
                                     MemoryResult res;
-                                    res.address = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + i;
+                                    res.address = regionStart + i;
                                     res.type = TYPE_AOB;
-                                    out->push_back(res);
-                                    if (out->size() >= 5000) break; // aşırı büyümeyi engelle
+                                    wp->out->push_back(res);
+                                    if (wp->out->size() >= 5000) break; // aşırı büyümeyi engelle (worker başına)
                                 }
                             }
                         }
@@ -817,7 +960,7 @@ DWORD WINAPI FirstScanThread(LPVOID lp) {
                                 else matched = CompareValuesAt(currPtr, params->t1, params->t2, currentType, params->scanType);
 
                                 if (matched) {
-                                    uintptr_t foundAddress = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + i;
+                                    uintptr_t foundAddress = regionStart + i;
                                     MemoryResult res;
                                     res.address = foundAddress;
                                     res.type = currentType;
@@ -827,26 +970,25 @@ DWORD WINAPI FirstScanThread(LPVOID lp) {
                                     else if (currentType == TYPE_8BYTES) res.val8Bytes = *(int64_t*)currPtr;
                                     else if (currentType == TYPE_FLOAT) res.valFloat = *(float*)currPtr;
                                     else if (currentType == TYPE_DOUBLE) res.valDouble = *(double*)currPtr;
-                                    out->push_back(res);
+                                    wp->out->push_back(res);
                                 }
                             }
                         }
                     }
                 }
             }
+            g_scanBytesDone.fetch_add((uint64_t)mbi.RegionSize, std::memory_order_relaxed);
             address = static_cast<char*>(mbi.BaseAddress) + mbi.RegionSize;
         } else break;
-
-        int percent = (int)(((unsigned long long)(uintptr_t)address * 100ULL) / maxAddr);
-        if (percent != lastPercent) { lastPercent = percent; PostMessageW(g_hMainWnd, WM_APP_PROGRESS, (WPARAM)percent, 0); }
     }
+}
 
-    PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, (LPARAM)1);
-    delete params;
+DWORD WINAPI FirstScanWorkerThread(LPVOID lp) {
+    ScanRangeFirst((FirstScanWorkerParams*)lp);
     return 0;
 }
 
-DWORD WINAPI NextScanThread(LPVOID lp) {
+DWORD WINAPI FirstScanThread(LPVOID lp) {
     ScanParams* params = (ScanParams*)lp;
     vector<MemoryResult>* out = new vector<MemoryResult>();
 
@@ -856,22 +998,99 @@ DWORD WINAPI NextScanThread(LPVOID lp) {
         return 0;
     }
 
-    size_t total = params->baseResults.size();
-    size_t idx = 0;
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    uintptr_t maxAddr = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
+    if (maxAddr == 0) maxAddr = 1;
 
     vector<int> aobPattern;
     if (params->vType == TYPE_AOB) aobPattern = ParseAOB(params->aobPattern);
 
-    for (const auto& res : params->baseResults) {
+    // Stack/Heap filtresi seçiliyse, taramaya başlamadan ÖNCE (worker'lar oluşmadan)
+    // tüm thread'lerin stack aralıklarını BİR KEZ hesapla; worker'lar bunu salt-okunur paylaşır.
+    if (params->regionFilter == REGION_STACK || params->regionFilter == REGION_HEAP) {
+        params->stackRanges = GetThreadStackRanges(GetProcessId(hProcess), hProcess);
+    }
+
+    // Çekirdek sayısı kadar (üst sınır MAX_SCAN_THREADS) worker'a böl
+    unsigned workerCount = sysInfo.dwNumberOfProcessors;
+    if (workerCount < 1) workerCount = 1;
+    if (workerCount > MAX_SCAN_THREADS) workerCount = MAX_SCAN_THREADS;
+
+    vector<FirstScanWorkerParams> wparams(workerCount);
+    vector<HANDLE> handles;
+    handles.reserve(workerCount);
+
+    uintptr_t chunkSize = maxAddr / workerCount;
+    if (chunkSize == 0) chunkSize = maxAddr;
+
+    g_scanBytesDone.store(0);
+
+    for (unsigned i = 0; i < workerCount; i++) {
+        wparams[i].shared = params;
+        wparams[i].aobPattern = &aobPattern;
+        wparams[i].startAddr = (uintptr_t)i * chunkSize;
+        wparams[i].endAddr = (i == workerCount - 1) ? maxAddr : (uintptr_t)(i + 1) * chunkSize;
+        wparams[i].out = new vector<MemoryResult>();
+
+        HANDLE h = CreateThread(NULL, 0, FirstScanWorkerThread, &wparams[i], 0, NULL);
+        if (h) {
+            handles.push_back(h);
+        } else {
+            // Thread oluşturma nadiren başarısız olabilir: bu parçayı senkron olarak
+            // orkestratör thread'inde çalıştır, tarama yine de tamamlansın.
+            ScanRangeFirst(&wparams[i]);
+        }
+    }
+
+    // Tüm worker'lar bitene kadar bekle; her 150ms'de bir toplam ilerlemeyi bildir.
+    DWORD waitResult;
+    do {
+        waitResult = handles.empty() ? WAIT_OBJECT_0
+            : WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, 150);
+        int percent = (int)((g_scanBytesDone.load() * 100ULL) / maxAddr);
+        if (percent > 100) percent = 100;
+        PostMessageW(g_hMainWnd, WM_APP_PROGRESS, (WPARAM)percent, 0);
+    } while (waitResult == WAIT_TIMEOUT);
+
+    for (HANDLE h : handles) CloseHandle(h);
+
+    // Worker sonuçlarını tek listede birleştir
+    size_t totalSize = 0;
+    for (auto& wp : wparams) totalSize += wp.out->size();
+    out->reserve(totalSize);
+    for (auto& wp : wparams) {
+        out->insert(out->end(), wp.out->begin(), wp.out->end());
+        delete wp.out;
+    }
+
+    PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, (LPARAM)1);
+    delete params;
+    return 0;
+}
+
+// --- Next Scan worker ---
+struct NextScanWorkerParams {
+    ScanParams* shared;
+    const vector<int>* aobPattern;
+    size_t startIdx, endIdx; // params->baseResults içindeki [startIdx, endIdx) aralığı
+    vector<MemoryResult>* out;
+};
+
+static void ScanRangeNext(NextScanWorkerParams* wp) {
+    ScanParams* params = wp->shared;
+    const auto& baseResults = params->baseResults;
+
+    for (size_t idx = wp->startIdx; idx < wp->endIdx; idx++) {
         if (g_scanCancel.load()) break;
-        idx++;
+        const MemoryResult& res = baseResults[idx];
 
         if (res.type == TYPE_AOB) {
-            if (!aobPattern.empty()) {
-                vector<uint8_t> buf(aobPattern.size());
+            if (wp->aobPattern && !wp->aobPattern->empty()) {
+                vector<uint8_t> buf(wp->aobPattern->size());
                 SIZE_T br;
                 if (ReadProcessMemory(hProcess, (LPCVOID)res.address, buf.data(), buf.size(), &br) && br == buf.size()) {
-                    if (MatchAOB(buf.data(), buf.size(), aobPattern)) out->push_back(res);
+                    if (MatchAOB(buf.data(), buf.size(), *wp->aobPattern)) wp->out->push_back(res);
                 }
             }
         } else {
@@ -912,13 +1131,90 @@ DWORD WINAPI NextScanThread(LPVOID lp) {
                     matched = currVal == prevVal;
                 }
 
-                if (matched) out->push_back(updatedRes);
+                if (matched) wp->out->push_back(updatedRes);
             }
         }
 
-        if (total > 0 && (idx % 200 == 0 || idx == total)) {
-            PostMessageW(g_hMainWnd, WM_APP_PROGRESS, (WPARAM)((idx * 100) / total), 0);
+        g_scanItemsDone.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+DWORD WINAPI NextScanWorkerThread(LPVOID lp) {
+    ScanRangeNext((NextScanWorkerParams*)lp);
+    return 0;
+}
+
+DWORD WINAPI NextScanThread(LPVOID lp) {
+    ScanParams* params = (ScanParams*)lp;
+    vector<MemoryResult>* out = new vector<MemoryResult>();
+
+    if (!hProcess) {
+        PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, 0);
+        delete params;
+        return 0;
+    }
+
+    size_t total = params->baseResults.size();
+
+    vector<int> aobPattern;
+    if (params->vType == TYPE_AOB) aobPattern = ParseAOB(params->aobPattern);
+
+    if (total == 0) {
+        PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, (LPARAM)0);
+        delete params;
+        return 0;
+    }
+
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    unsigned coreCount = sysInfo.dwNumberOfProcessors;
+    if (coreCount < 1) coreCount = 1;
+    // Küçük listeler için gereksiz thread oluşturmayı önle (en az ~100 öğe/worker)
+    unsigned workerCount = (unsigned)std::min<size_t>(coreCount, std::max<size_t>(1, total / 100));
+    if (workerCount > MAX_SCAN_THREADS) workerCount = MAX_SCAN_THREADS;
+    if (workerCount < 1) workerCount = 1;
+
+    vector<NextScanWorkerParams> wparams(workerCount);
+    vector<HANDLE> handles;
+    handles.reserve(workerCount);
+
+    size_t chunk = total / workerCount;
+    if (chunk == 0) chunk = total;
+
+    g_scanItemsDone.store(0);
+
+    for (unsigned i = 0; i < workerCount; i++) {
+        wparams[i].shared = params;
+        wparams[i].aobPattern = &aobPattern;
+        wparams[i].startIdx = (size_t)i * chunk;
+        wparams[i].endIdx = (i == workerCount - 1) ? total : (size_t)(i + 1) * chunk;
+        wparams[i].out = new vector<MemoryResult>();
+
+        HANDLE h = CreateThread(NULL, 0, NextScanWorkerThread, &wparams[i], 0, NULL);
+        if (h) {
+            handles.push_back(h);
+        } else {
+            ScanRangeNext(&wparams[i]);
         }
+    }
+
+    DWORD waitResult;
+    do {
+        waitResult = handles.empty() ? WAIT_OBJECT_0
+            : WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, 150);
+        int percent = (int)((g_scanItemsDone.load() * 100ULL) / (uint64_t)total);
+        if (percent > 100) percent = 100;
+        PostMessageW(g_hMainWnd, WM_APP_PROGRESS, (WPARAM)percent, 0);
+    } while (waitResult == WAIT_TIMEOUT);
+
+    for (HANDLE h : handles) CloseHandle(h);
+
+    size_t totalSize = 0;
+    for (auto& wp : wparams) totalSize += wp.out->size();
+    out->reserve(totalSize);
+    for (auto& wp : wparams) {
+        out->insert(out->end(), wp.out->begin(), wp.out->end());
+        delete wp.out;
     }
 
     PostMessageW(g_hMainWnd, WM_APP_SCANDONE, (WPARAM)out, (LPARAM)0);
@@ -1783,50 +2079,60 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(hComboScanType, CB_ADDSTRING, 0, (LPARAM)L"Unchanged value");
         SendMessageW(hComboScanType, CB_SETCURSEL, 0, 0);
 
-        CreateWindowW(L"STATIC", L"Value:", WS_VISIBLE | WS_CHILD, 36, 204, 50, 20, hwnd, NULL, NULL, NULL);
+        // V2: Bölge Filtreleme (Region Filtering) — sadece Modül/Heap/Stack taransın, çöp sonuçlar azalsın
+        CreateWindowW(L"STATIC", L"Bölge:", WS_VISIBLE | WS_CHILD, 36, 204, 55, 18, hwnd, NULL, NULL, NULL);
+        hComboRegion = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL, 96, 200, 210, 200, hwnd, (HMENU)ID_COMBO_REGION, NULL, NULL);
+        SendMessageW(hComboRegion, CB_ADDSTRING, 0, (LPARAM)L"Tümü");
+        SendMessageW(hComboRegion, CB_ADDSTRING, 0, (LPARAM)L"Sadece Modül (.text/.data)");
+        SendMessageW(hComboRegion, CB_ADDSTRING, 0, (LPARAM)L"Sadece Heap (Yığın)");
+        SendMessageW(hComboRegion, CB_ADDSTRING, 0, (LPARAM)L"Sadece Stack (Çağrı Yığını)");
+        SendMessageW(hComboRegion, CB_SETDROPPEDWIDTH, 260, 0); // uzun etiketler kapalı kutuyu değil sadece açılır listeyi genişletsin
+        SendMessageW(hComboRegion, CB_SETCURSEL, 0, 0); // Varsayılan: Tümü
+
+        CreateWindowW(L"STATIC", L"Value:", WS_VISIBLE | WS_CHILD, 36, 244, 50, 20, hwnd, NULL, NULL, NULL);
         // Değer geçmişi için normal EDIT yerine düzenlenebilir COMBOBOX kullanılıyor (Hızlı Değer Filtreleme kısayolları ile birlikte)
-        hEditVal = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 96, 200, 170, 220, hwnd, (HMENU)ID_EDIT_VAL, NULL, NULL);
-        hEditVal2 = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 276, 200, 170, 26, hwnd, (HMENU)ID_EDIT_VAL2, NULL, NULL);
+        hEditVal = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 96, 240, 170, 220, hwnd, (HMENU)ID_EDIT_VAL, NULL, NULL);
+        hEditVal2 = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 276, 240, 170, 26, hwnd, (HMENU)ID_EDIT_VAL2, NULL, NULL);
 
-        hBtnFirst = CreateWindowW(L"BUTTON", L"First Scan (F2)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 234, 200, 34, hwnd, (HMENU)ID_BTN_FIRST, NULL, NULL);
-        hBtnNext = CreateWindowW(L"BUTTON", L"Next Scan (F3)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 248, 234, 200, 34, hwnd, (HMENU)ID_BTN_NEXT, NULL, NULL);
+        hBtnFirst = CreateWindowW(L"BUTTON", L"First Scan (F2)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 274, 200, 34, hwnd, (HMENU)ID_BTN_FIRST, NULL, NULL);
+        hBtnNext = CreateWindowW(L"BUTTON", L"Next Scan (F3)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 248, 274, 200, 34, hwnd, (HMENU)ID_BTN_NEXT, NULL, NULL);
 
-        hProgressBar = CreateWindowExW(0, PROGRESS_CLASSW, NULL, WS_CHILD | WS_VISIBLE, 36, 278, 290, 22, hwnd, (HMENU)ID_PROGRESS, NULL, NULL);
+        hProgressBar = CreateWindowExW(0, PROGRESS_CLASSW, NULL, WS_CHILD | WS_VISIBLE, 36, 318, 290, 22, hwnd, (HMENU)ID_PROGRESS, NULL, NULL);
         SendMessageW(hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-        hBtnStop = CreateWindowW(L"BUTTON", L"Durdur", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 336, 276, 112, 26, hwnd, (HMENU)ID_BTN_STOPSCAN, NULL, NULL);
+        hBtnStop = CreateWindowW(L"BUTTON", L"Durdur", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 336, 316, 112, 26, hwnd, (HMENU)ID_BTN_STOPSCAN, NULL, NULL);
         EnableWindow(hBtnStop, FALSE);
 
         // --- Panel: Bellek Yazma — pointer zinciri + hex görüntüleyici + NOP aracı ---
-        CreateWindowW(L"STATIC", L"Adres (Hex):", WS_VISIBLE | WS_CHILD, 36, 398, 90, 20, hwnd, NULL, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Adres (Hex):", WS_VISIBLE | WS_CHILD, 36, 438, 90, 20, hwnd, NULL, NULL, NULL);
         // Adres geçmişi için düzenlenebilir COMBOBOX
-        hEditAddr = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 132, 394, 130, 200, hwnd, (HMENU)ID_EDIT_ADDR, NULL, NULL);
+        hEditAddr = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL, 132, 434, 130, 200, hwnd, (HMENU)ID_EDIT_ADDR, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"Yeni Değer:", WS_VISIBLE | WS_CHILD, 276, 398, 80, 20, hwnd, NULL, NULL, NULL);
-        hEditNewVal = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 362, 394, 82, 26, hwnd, (HMENU)ID_EDIT_NEWVAL, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Yeni Değer:", WS_VISIBLE | WS_CHILD, 276, 438, 80, 20, hwnd, NULL, NULL, NULL);
+        hEditNewVal = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 362, 434, 82, 26, hwnd, (HMENU)ID_EDIT_NEWVAL, NULL, NULL);
 
-        CreateWindowW(L"BUTTON", L"Değeri Değiştir (Write)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 428, 488, 34, hwnd, (HMENU)ID_BTN_WRITE, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Değeri Değiştir (Write)", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 468, 488, 34, hwnd, (HMENU)ID_BTN_WRITE, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"Açıklama:", WS_VISIBLE | WS_CHILD, 36, 476, 70, 20, hwnd, NULL, NULL, NULL);
-        hEditDesc = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 112, 472, 200, 26, hwnd, (HMENU)ID_EDIT_DESC, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Listeye Ekle", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 324, 471, 120, 28, hwnd, (HMENU)ID_BTN_ADDLIST, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Açıklama:", WS_VISIBLE | WS_CHILD, 36, 516, 70, 20, hwnd, NULL, NULL, NULL);
+        hEditDesc = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 112, 512, 200, 26, hwnd, (HMENU)ID_EDIT_DESC, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Listeye Ekle", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 324, 511, 120, 28, hwnd, (HMENU)ID_BTN_ADDLIST, NULL, NULL);
 
         // Çoklu seviyeli pointer zinciri girişi: "14,2C,8" gibi virgülle ayrılmış hex offsetler
-        CreateWindowW(L"STATIC", L"Ofset Zinciri (hex,virgül):", WS_VISIBLE | WS_CHILD, 36, 510, 160, 18, hwnd, NULL, NULL, NULL);
-        hEditChainOff = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 200, 506, 110, 24, hwnd, (HMENU)ID_EDIT_CHAINOFF, NULL, NULL);
-        CreateWindowW(L"STATIC", L"Max Sv:", WS_VISIBLE | WS_CHILD, 318, 510, 50, 18, hwnd, NULL, NULL, NULL);
-        hEditMaxLevel = CreateWindowW(L"EDIT", L"2", WS_VISIBLE | WS_CHILD | WS_BORDER, 372, 506, 36, 24, hwnd, (HMENU)ID_EDIT_MAXLEVEL, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Zincir Ekle", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 540, 130, 28, hwnd, (HMENU)ID_BTN_ADDCHAIN, NULL, NULL);
-        hBtnPointer = CreateWindowW(L"BUTTON", L"Pointer Tarama", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 176, 540, 348, 28, hwnd, (HMENU)ID_BTN_POINTERSCAN, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Ofset Zinciri (hex,virgül):", WS_VISIBLE | WS_CHILD, 36, 550, 160, 18, hwnd, NULL, NULL, NULL);
+        hEditChainOff = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER, 200, 546, 110, 24, hwnd, (HMENU)ID_EDIT_CHAINOFF, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Max Sv:", WS_VISIBLE | WS_CHILD, 318, 550, 50, 18, hwnd, NULL, NULL, NULL);
+        hEditMaxLevel = CreateWindowW(L"EDIT", L"2", WS_VISIBLE | WS_CHILD | WS_BORDER, 372, 546, 36, 24, hwnd, (HMENU)ID_EDIT_MAXLEVEL, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Zincir Ekle", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 580, 130, 28, hwnd, (HMENU)ID_BTN_ADDCHAIN, NULL, NULL);
+        hBtnPointer = CreateWindowW(L"BUTTON", L"Pointer Tarama", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 176, 580, 348, 28, hwnd, (HMENU)ID_BTN_POINTERSCAN, NULL, NULL);
 
-        CreateWindowW(L"BUTTON", L"Hex Görüntüleyici", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 578, 239, 32, hwnd, (HMENU)ID_BTN_HEXVIEW, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Disassembler / NOP", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 286, 578, 238, 32, hwnd, (HMENU)ID_BTN_NOPTOOL, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Hex Görüntüleyici", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 36, 618, 239, 32, hwnd, (HMENU)ID_BTN_HEXVIEW, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Disassembler / NOP", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 286, 618, 238, 32, hwnd, (HMENU)ID_BTN_NOPTOOL, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"Dondurma Hızı (ms):", WS_VISIBLE | WS_CHILD, 36, 624, 170, 18, hwnd, NULL, NULL, NULL);
-        hEditFreezeMs = CreateWindowW(L"EDIT", L"150", WS_VISIBLE | WS_CHILD | WS_BORDER, 214, 620, 60, 24, hwnd, (HMENU)ID_EDIT_FREEZEMS, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Uygula", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 286, 618, 90, 28, hwnd, (HMENU)ID_BTN_APPLYFREEZE, NULL, NULL);
+        CreateWindowW(L"STATIC", L"Dondurma Hızı (ms):", WS_VISIBLE | WS_CHILD, 36, 664, 170, 18, hwnd, NULL, NULL, NULL);
+        hEditFreezeMs = CreateWindowW(L"EDIT", L"150", WS_VISIBLE | WS_CHILD | WS_BORDER, 214, 660, 60, 24, hwnd, (HMENU)ID_EDIT_FREEZEMS, NULL, NULL);
+        CreateWindowW(L"BUTTON", L"Uygula", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 286, 658, 90, 28, hwnd, (HMENU)ID_BTN_APPLYFREEZE, NULL, NULL);
 
         // --- Panel: Log — yükseklik pencereyle birlikte esner (bkz. RelayoutMainWindow) ---
-        hLogBox = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY, 36, 742, 488, 96, hwnd, (HMENU)ID_LOG_BOX, NULL, NULL);
+        hLogBox = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY, 36, 782, 488, 96, hwnd, (HMENU)ID_LOG_BOX, NULL, NULL);
 
         // --- Panel: Sonuçlar — genişlik pencereyle birlikte esner (bkz. RelayoutMainWindow) ---
         CreateWindowW(L"STATIC", L"Filtre:", WS_VISIBLE | WS_CHILD, 576, 62, 50, 20, hwnd, NULL, NULL, NULL);
@@ -1975,10 +2281,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 ScanParams* params = new ScanParams();
                 params->t1 = t1; params->t2 = t2; params->vType = vType; params->scanType = scanType;
                 if (vType == TYPE_AOB) params->aobPattern = valBuf;
+                bool isFirst = (LOWORD(wParam) == ID_BTN_FIRST);
+                if (isFirst && hComboRegion) {
+                    params->regionFilter = (int)SendMessageW(hComboRegion, CB_GETCURSEL, 0, 0);
+                    if (params->regionFilter < 0) params->regionFilter = REGION_ALL;
+                }
 
                 if (wcslen(valBuf) > 0) AddToHistory(hEditVal, g_valHistory, valBuf);
 
-                bool isFirst = (LOWORD(wParam) == ID_BTN_FIRST);
                 if (!isFirst) params->baseResults = results; // ana thread'de anlık kopya alınır (yarış durumu yok)
 
                 g_scanCancel = false;
@@ -2419,7 +2729,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, CLASS_NAME, L"HexaCore | Bellek Tarama/Değiştirme Aracı",
+        0, CLASS_NAME, L"HexaCore | Bellek tarama/düzenleme aracı",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, MAIN_WIN_MIN_W, MAIN_WIN_MIN_H,
         NULL, NULL, hInstance, NULL
