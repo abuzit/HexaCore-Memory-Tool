@@ -34,9 +34,3 @@
 ## ⚠️ Disclaimer
 
 HexaCore is developed strictly for educational purposes, software debugging, and single-player game analysis. The creator assumes no liability and is not responsible for any misuse or bans resulting from the use of this software. Use at your own risk.
-
----
-
-## 📜 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
